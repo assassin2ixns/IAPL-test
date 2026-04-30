@@ -201,7 +201,8 @@ def main(args):
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=find_unused_parameters)
         model_without_ddp = model.module
     if args.ema:
-        model_ema = ModelEmaV2(model_without_ddp, decay=0.9999)
+        ema_source_model = model.module if args.distributed else model
+        model_ema = ModelEmaV2(ema_source_model, decay=0.9999)
         print('-----------use EMA train mode----------')
     
     if args.eval:

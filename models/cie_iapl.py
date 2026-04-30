@@ -319,16 +319,16 @@ class CIEIAPLModel(nn.Module):
 
     def _gate_probs(self, all_logits, gate_features):
         if self.args.cie_gate_mode == "uniform":
-            return self._uniform_gate_probs(all_logits)
+            return self._uniform_gate_probs(all_logits), all_logits.new_zeros(all_logits.shape)
         if self.training and self.current_stage == "warmup":
-            return self._uniform_gate_probs(all_logits)
+            return self._uniform_gate_probs(all_logits), all_logits.new_zeros(all_logits.shape)
 
-        gate_probs, _ = self.gate(gate_features)
+        gate_probs, gate_logits = self.gate(gate_features)
         if not self.args.cie_use_base_expert:
             gate_probs = gate_probs.clone()
             gate_probs[:, 0] = 0.0
             gate_probs = gate_probs / gate_probs.sum(dim=1, keepdim=True).clamp_min(1e-8)
-        return gate_probs
+        return gate_probs, gate_logits
 
     def _select_eval_logits(self, outputs):
         mode = self.args.cie_eval_mode
@@ -424,11 +424,13 @@ class CIEIAPLModel(nn.Module):
             tile_entropy,
             tile_variance,
         )
-        gate_probs = self._gate_probs(all_logits, gate_features)
+        gate_probs, gate_logits = self._gate_probs(all_logits, gate_features)
         final_logit = (gate_probs * all_logits).sum(dim=1)
+        uniform_logit = all_logits.mean(dim=1)
 
         outputs = {
             "final_logit": final_logit,
+            "uniform_logit": uniform_logit,
             "base_logit": base_logit,
             "artifact_logit": artifact_logit,
             "structure_logit": structure_logit,
@@ -436,6 +438,7 @@ class CIEIAPLModel(nn.Module):
             "expert_logits": expert_logits,
             "all_logits": all_logits,
             "gate_probs": gate_probs,
+            "gate_logits": gate_logits,
             "gate_features": gate_features,
             "family_delta": family_delta,
             "base_family_logits": base_family_logits,
@@ -446,6 +449,7 @@ class CIEIAPLModel(nn.Module):
             "tile_max": tile_max,
             "tile_min": tile_min,
             "tile_family_name": tile_family_name,
+            "patch_family_name": tile_family_name,
             "stage": self.current_stage,
         }
 

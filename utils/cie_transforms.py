@@ -120,7 +120,7 @@ def build_tile_views(images, grid=2):
 def build_tile_dropout_views(images, grid=2, drop_prob=0.25):
     grid = int(grid)
     if grid <= 1:
-        return images, 1
+        return images, 1, "tile_dropout"
 
     batch, channels, height, width = images.shape
     tile_count = grid * grid
@@ -149,7 +149,7 @@ def build_tile_dropout_views(images, grid=2, drop_prob=0.25):
             tile_idx += 1
 
     tile_views = torch.stack(tiles, dim=1).reshape(batch * tile_count, channels, height, width)
-    return tile_views, tile_count
+    return tile_views, tile_count, "tile_dropout"
 
 
 def build_tile_mask_views(images, grid=2, mask_ratio=0.25):
@@ -198,14 +198,9 @@ def build_patch_family_views(images, mode="canonical", training=True, grid=2, dr
     if mode != "random_family":
         raise ValueError(f"Unsupported patch view mode: {mode}")
 
-    family_count = 3 if mask_ratio > 0 else 2
-    family = int(torch.randint(0, family_count, (1,), device=images.device).item())
+    family = int(torch.randint(0, 2, (1,), device=images.device).item())
     if family == 0:
         tile_views, tile_count = build_tile_views(images, grid=grid)
         return tile_views, tile_count, "tile"
-    if family == 1:
-        tile_views, tile_count = build_tile_dropout_views(images, grid=grid, drop_prob=drop_prob)
-        return tile_views, tile_count, "tile_dropout"
 
-    tile_views, tile_count = build_tile_mask_views(images, grid=grid, mask_ratio=mask_ratio)
-    return tile_views, tile_count, "tile_mask"
+    return build_tile_dropout_views(images, grid=grid, drop_prob=drop_prob)

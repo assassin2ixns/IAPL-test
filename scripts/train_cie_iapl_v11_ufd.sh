@@ -37,6 +37,8 @@ python -m torch.distributed.launch \
     --cie_num_specialists 3 \
     --cie_warmup_epochs 2 \
     --cie_gate_warmup_epochs 1 \
+    --cie_use_family_base_refs True \
+    --cie_gate_use_aux_stat True \
     --cie_lambda_family_margin 0.5 \
     --cie_art_margin 0.1 \
     --cie_structure_margin 0.1 \
