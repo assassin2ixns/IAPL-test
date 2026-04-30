@@ -3,26 +3,14 @@ set -euo pipefail
 
 DATASET_PATH=${DATASET_PATH:-/data2/caiguoqing/Datasets/UniversalFakeDetect}
 CLIP_PATH=${CLIP_PATH:-/data2/caiguoqing/clip_weights/ViT-L-14.pt}
-PRETRAINED_MODEL=${PRETRAINED_MODEL:-results/cie_iapl_ufd/checkpoint_best_acc.pth}
-CIE_EVAL_MODE=${CIE_EVAL_MODE:-${EXPERT_MODE:-final}}
+PRETRAINED_MODEL=${PRETRAINED_MODEL:-results/cie_iapl_v11_ufd/checkpoint_best_acc.pth}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-6}
-NPROC_PER_NODE=${NPROC_PER_NODE:-1}
-MASTER_PORT=${MASTER_PORT:-29583}
-
-case "${CIE_EVAL_MODE}" in
-    base|artifact|structure|patch|uniform|final) ;;
-    *)
-        echo "CIE_EVAL_MODE must be one of: base artifact structure patch uniform final" >&2
-        exit 2
-        ;;
-esac
+OUTPUT_DIR=${OUTPUT_DIR:-results}
+MODEL_NAME=${MODEL_NAME:-cie_iapl_v11_diag_clean}
 
 export CUDA_VISIBLE_DEVICES
 
-python -m torch.distributed.launch \
-    --nproc_per_node="${NPROC_PER_NODE}" \
-    --master_port "${MASTER_PORT}" \
-    main.py \
+python tools/eval_cie_iapl_diagnostics.py \
     --model_variant cie_iapl \
     --eval \
     --batchsize 16 \
@@ -38,5 +26,6 @@ python -m torch.distributed.launch \
     --gate True \
     --condition True \
     --smooth True \
-    --cie_eval_mode "${CIE_EVAL_MODE}" \
+    --output_dir "${OUTPUT_DIR}" \
+    --model_name "${MODEL_NAME}" \
     "$@"

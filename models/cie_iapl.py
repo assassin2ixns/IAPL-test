@@ -10,8 +10,8 @@ from .clip_models import (
 )
 from utils.cie_transforms import (
     build_artifact_view,
+    build_patch_family_views,
     build_structure_view,
-    build_tile_views,
 )
 
 
@@ -19,17 +19,13 @@ class CounterfactualReliabilityGate(nn.Module):
     def __init__(self, hidden_dim=32):
         super().__init__()
         self.scorer = nn.Sequential(
-            nn.Linear(3, hidden_dim),
+            nn.Linear(4, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, all_logits):
-        probs = all_logits.sigmoid()
-        confidence = torch.maximum(probs, 1.0 - probs)
-        delta_from_base = all_logits - all_logits[:, :1]
-        expert_inputs = torch.stack([all_logits, confidence, delta_from_base], dim=-1)
-        gate_logits = self.scorer(expert_inputs).squeeze(-1)
+    def forward(self, gate_features):
+        gate_logits = self.scorer(gate_features).squeeze(-1)
         return F.softmax(gate_logits, dim=1), gate_logits
 
 
@@ -37,7 +33,7 @@ class CIEIAPLModel(nn.Module):
     def __init__(self, args):
         super().__init__()
         if args.cie_num_specialists != 3:
-            raise ValueError("CIE-IAPL v1 implements exactly 3 specialist experts.")
+            raise ValueError("CIE-IAPL v1.1 implements exactly 3 specialist experts.")
 
         self.args = args
         self.num_specialists = args.cie_num_specialists
@@ -92,6 +88,7 @@ class CIEIAPLModel(nn.Module):
             "loss_div": args.cie_lambda_div,
             "loss_patch": args.cie_lambda_patch,
             "loss_fake": args.cie_lambda_fake,
+            "loss_family_margin": args.cie_lambda_family_margin,
         }
 
         if args.smooth:
@@ -260,8 +257,18 @@ class CIEIAPLModel(nn.Module):
             self.specialist_heads[specialist_idx],
         )
 
-    def _run_patch_expert(self, images, base_ctx, base_deep_prompts):
-        tile_images, tile_count = build_tile_views(images, grid=self.args.cie_patch_tile_grid)
+    def _run_base_patch_family(self, tile_images, tile_count, batch_size, base_ctx, base_deep_prompts):
+        ctx, _ = self._make_ctx(base_ctx, tile_images, specialist_idx=None)
+        tile_logits, tile_features = self._encode_with_prompts(
+            tile_images,
+            ctx,
+            base_deep_prompts,
+            self.fc_binary,
+        )
+        tile_logits = tile_logits.view(batch_size, tile_count)
+        return tile_logits.mean(dim=1), tile_features, tile_logits
+
+    def _run_patch_expert(self, images, tile_images, tile_count, base_ctx, base_deep_prompts):
         if self.args.cie_condition_source == "original":
             ctx, _ = self._make_ctx(base_ctx, images, specialist_idx=2)
             if ctx is not None:
@@ -281,7 +288,9 @@ class CIEIAPLModel(nn.Module):
         alpha = F.softmax(tile_logits / max(self.args.cie_patch_temp, 1e-6), dim=1)
         tile_entropy = -(alpha * torch.log(alpha.clamp_min(1e-8))).sum(dim=1)
         tile_variance = tile_logits.var(dim=1, unbiased=False)
-        return patch_logit, tile_features, tile_logits, tile_entropy, tile_variance
+        tile_max = tile_logits.max(dim=1).values
+        tile_min = tile_logits.min(dim=1).values
+        return patch_logit, tile_features, tile_logits, tile_entropy, tile_variance, tile_max, tile_min
 
     def _uniform_gate_probs(self, all_logits):
         gate_probs = all_logits.new_full(all_logits.shape, 1.0 / all_logits.shape[1])
@@ -290,13 +299,31 @@ class CIEIAPLModel(nn.Module):
             gate_probs[:, 1:] = 1.0 / (all_logits.shape[1] - 1)
         return gate_probs
 
-    def _gate_probs(self, all_logits):
+    def _build_gate_features(self, all_logits, base_family_logits, tile_entropy, tile_variance):
+        confidence = torch.maximum(all_logits.sigmoid(), 1.0 - all_logits.sigmoid())
+        family_delta = all_logits.new_zeros(all_logits.shape)
+        if self.args.cie_use_family_base_refs:
+            family_delta[:, 1] = all_logits[:, 1] - base_family_logits["artifact"]
+            family_delta[:, 2] = all_logits[:, 2] - base_family_logits["structure"]
+            family_delta[:, 3] = all_logits[:, 3] - base_family_logits["patch"]
+        else:
+            family_delta = all_logits - all_logits[:, :1]
+            family_delta[:, 0] = 0.0
+
+        aux = all_logits.new_zeros(all_logits.shape)
+        if self.args.cie_gate_use_aux_stat:
+            aux[:, 3] = tile_entropy
+            aux[:, 3] = aux[:, 3] + 0.0 * tile_variance
+
+        return torch.stack([all_logits, confidence, family_delta, aux], dim=-1), family_delta
+
+    def _gate_probs(self, all_logits, gate_features):
         if self.args.cie_gate_mode == "uniform":
             return self._uniform_gate_probs(all_logits)
         if self.training and self.current_stage == "warmup":
             return self._uniform_gate_probs(all_logits)
 
-        gate_probs, _ = self.gate(all_logits)
+        gate_probs, _ = self.gate(gate_features)
         if not self.args.cie_use_base_expert:
             gate_probs = gate_probs.clone()
             gate_probs[:, 0] = 0.0
@@ -310,16 +337,16 @@ class CIEIAPLModel(nn.Module):
         if mode == "base":
             return outputs["base_logit"]
         if mode == "artifact":
-            return outputs["expert_logits"][:, 0]
+            return outputs["artifact_logit"]
         if mode == "structure":
-            return outputs["expert_logits"][:, 1]
+            return outputs["structure_logit"]
         if mode == "patch":
-            return outputs["expert_logits"][:, 2]
+            return outputs["patch_logit"]
         if mode == "uniform":
             return outputs["all_logits"].mean(dim=1)
         raise ValueError(f"Unsupported cie_eval_mode: {mode}")
 
-    def forward(self, images):
+    def _forward_impl(self, images):
         base_ctx, base_deep_prompts = self._base_prompt_parts()
 
         base_logit, _ = self._run_base_expert(images, base_ctx, base_deep_prompts)
@@ -329,18 +356,36 @@ class CIEIAPLModel(nn.Module):
             mode=self.args.cie_artifact_train_mode,
             training=self.training,
         )
+        structure_images = build_structure_view(
+            images,
+            mode=self.args.cie_structure_train_mode,
+            training=self.training,
+        )
+        patch_tile_images, tile_count, tile_family_name = build_patch_family_views(
+            images,
+            mode=self.args.cie_patch_train_mode,
+            training=self.training,
+            grid=self.args.cie_patch_tile_grid,
+            drop_prob=self.args.cie_patch_dropout_prob,
+            mask_ratio=self.args.cie_patch_mask_ratio,
+        )
+
+        base_artifact_logit, _ = self._run_base_expert(artifact_images, base_ctx, base_deep_prompts)
+        base_structure_logit, _ = self._run_base_expert(structure_images, base_ctx, base_deep_prompts)
+        base_patch_logit, _, base_tile_logits = self._run_base_patch_family(
+            patch_tile_images,
+            tile_count,
+            images.shape[0],
+            base_ctx,
+            base_deep_prompts,
+        )
+
         artifact_logit, _ = self._run_specialist_expert(
             images,
             artifact_images,
             base_ctx,
             base_deep_prompts,
             specialist_idx=0,
-        )
-
-        structure_images = build_structure_view(
-            images,
-            mode=self.args.cie_structure_train_mode,
-            training=self.training,
         )
         structure_logit, _ = self._run_specialist_expert(
             images,
@@ -349,46 +394,89 @@ class CIEIAPLModel(nn.Module):
             base_deep_prompts,
             specialist_idx=1,
         )
-
-        patch_logit, _, tile_logits, tile_entropy, tile_variance = self._run_patch_expert(
+        (
+            patch_logit,
+            _,
+            tile_logits,
+            tile_entropy,
+            tile_variance,
+            tile_max,
+            tile_min,
+        ) = self._run_patch_expert(
             images,
+            patch_tile_images,
+            tile_count,
             base_ctx,
             base_deep_prompts,
         )
 
         expert_logits = torch.stack([artifact_logit, structure_logit, patch_logit], dim=1)
-        all_logits = torch.cat([base_logit.unsqueeze(1), expert_logits], dim=1)
-        gate_probs = self._gate_probs(all_logits)
+        all_logits = torch.stack([base_logit, artifact_logit, structure_logit, patch_logit], dim=1)
+        base_family_logits = {
+            "orig": base_logit,
+            "artifact": base_artifact_logit,
+            "structure": base_structure_logit,
+            "patch": base_patch_logit,
+        }
+        gate_features, family_delta = self._build_gate_features(
+            all_logits,
+            base_family_logits,
+            tile_entropy,
+            tile_variance,
+        )
+        gate_probs = self._gate_probs(all_logits, gate_features)
         final_logit = (gate_probs * all_logits).sum(dim=1)
 
         outputs = {
             "final_logit": final_logit,
             "base_logit": base_logit,
+            "artifact_logit": artifact_logit,
+            "structure_logit": structure_logit,
+            "patch_logit": patch_logit,
             "expert_logits": expert_logits,
             "all_logits": all_logits,
             "gate_probs": gate_probs,
+            "gate_features": gate_features,
+            "family_delta": family_delta,
+            "base_family_logits": base_family_logits,
+            "base_tile_logits": base_tile_logits,
             "tile_logits": tile_logits,
             "tile_entropy": tile_entropy,
             "tile_variance": tile_variance,
+            "tile_max": tile_max,
+            "tile_min": tile_min,
+            "tile_family_name": tile_family_name,
             "stage": self.current_stage,
         }
 
         if self.args.cie_debug_log:
             z_means = all_logits.detach().mean(dim=0).cpu().tolist()
             q_means = gate_probs.detach().mean(dim=0).cpu().tolist()
+            d_means = family_delta.detach().mean(dim=0).cpu().tolist()
             print(
-                "[CIE_IAPL] batch z_mean={:.4f}/{:.4f}/{:.4f}/{:.4f} q_mean={:.4f}/{:.4f}/{:.4f}/{:.4f}".format(
+                "[CIE_IAPL] patch_family={} mean_z: base/art/str/patch={:.4f}/{:.4f}/{:.4f}/{:.4f} "
+                "mean_q: base/art/str/patch={:.4f}/{:.4f}/{:.4f}/{:.4f} "
+                "mean_family_delta: art/str/patch={:.4f}/{:.4f}/{:.4f} tile_entropy_mean={:.4f}".format(
+                    tile_family_name,
                     z_means[0], z_means[1], z_means[2], z_means[3],
                     q_means[0], q_means[1], q_means[2], q_means[3],
+                    d_means[1], d_means[2], d_means[3],
+                    tile_entropy.detach().mean().item(),
                 )
             )
 
+        return outputs
+
+    def forward_debug(self, images):
+        return self._forward_impl(images)
+
+    def forward(self, images):
+        outputs = self._forward_impl(images)
         if self.training:
             return outputs
         return self._select_eval_logits(outputs)
 
-    def _loss_diversity(self, all_logits):
-        residuals = all_logits[:, 1:] - all_logits[:, :1]
+    def _loss_diversity(self, residuals):
         if residuals.shape[0] < 2:
             return residuals.sum() * 0.0
         residuals = residuals - residuals.mean(dim=0, keepdim=True)
@@ -397,14 +485,26 @@ class CIEIAPLModel(nn.Module):
         off_diag = corr - torch.diag(torch.diag(corr))
         return off_diag.pow(2).sum() / 6.0
 
+    def _family_margin_loss(self, spec_logit, base_logit, targets, margin):
+        spec_risk = F.binary_cross_entropy_with_logits(spec_logit, targets, reduction="none")
+        base_risk = F.binary_cross_entropy_with_logits(base_logit, targets, reduction="none")
+        return F.relu(margin + spec_risk - base_risk), spec_risk, base_risk
+
     def get_criterion(self, outputs, targets):
         targets = targets.float().view(-1)
         final_logit = outputs["final_logit"]
         base_logit = outputs["base_logit"]
+        artifact_logit = outputs["artifact_logit"]
+        structure_logit = outputs["structure_logit"]
+        patch_logit = outputs["patch_logit"]
         expert_logits = outputs["expert_logits"]
         all_logits = outputs["all_logits"]
         gate_probs = outputs["gate_probs"]
+        base_family_logits = outputs["base_family_logits"]
+        family_delta = outputs["family_delta"]
         tile_logits = outputs["tile_logits"]
+        tile_entropy = outputs["tile_entropy"]
+        tile_variance = outputs["tile_variance"]
 
         target_experts = targets.unsqueeze(1).expand_as(expert_logits)
         target_all = targets.unsqueeze(1).expand_as(all_logits)
@@ -429,7 +529,39 @@ class CIEIAPLModel(nn.Module):
         loss_dict["loss_oracle"] = F.relu(
             self.args.cie_oracle_margin + best_risk - risks[:, 0]
         ).mean()
-        loss_dict["loss_div"] = self._loss_diversity(all_logits)
+
+        residuals = torch.stack(
+            [
+                artifact_logit - base_family_logits["artifact"],
+                structure_logit - base_family_logits["structure"],
+                patch_logit - base_family_logits["patch"],
+            ],
+            dim=1,
+        )
+        loss_dict["loss_div"] = self._loss_diversity(residuals)
+
+        art_margin, _, _ = self._family_margin_loss(
+            artifact_logit,
+            base_family_logits["artifact"],
+            targets,
+            self.args.cie_art_margin,
+        )
+        structure_margin, _, _ = self._family_margin_loss(
+            structure_logit,
+            base_family_logits["structure"],
+            targets,
+            self.args.cie_structure_margin,
+        )
+        patch_margin, _, _ = self._family_margin_loss(
+            patch_logit,
+            base_family_logits["patch"],
+            targets,
+            self.args.cie_patch_margin,
+        )
+        loss_dict["loss_family_margin"] = torch.stack(
+            [art_margin, structure_margin, patch_margin],
+            dim=1,
+        ).mean()
 
         alpha = F.softmax(tile_logits / max(self.args.cie_patch_temp, 1e-6), dim=1)
         entropy = -(alpha * torch.log(alpha.clamp_min(1e-8))).sum(dim=1)
@@ -442,9 +574,17 @@ class CIEIAPLModel(nn.Module):
             loss_dict["loss_patch"] = zero
 
         hard_fake_mask = (targets == 1) & (base_logit < self.args.cie_hard_fake_threshold)
+        correction_orig = expert_logits - base_logit.unsqueeze(1)
+        correction_family = torch.stack(
+            [
+                artifact_logit - base_family_logits["artifact"],
+                structure_logit - base_family_logits["structure"],
+                patch_logit - base_family_logits["patch"],
+            ],
+            dim=1,
+        )
         if hard_fake_mask.any():
-            corrections = expert_logits[hard_fake_mask] - base_logit[hard_fake_mask].unsqueeze(1)
-            best_correction = corrections.max(dim=1).values
+            best_correction = correction_orig[hard_fake_mask].max(dim=1).values
             loss_dict["loss_fake"] = F.relu(
                 self.args.cie_hard_fake_margin - best_correction
             ).mean()
@@ -457,9 +597,27 @@ class CIEIAPLModel(nn.Module):
         loss_dict["diag_oracle_match"] = oracle_match.mean().detach()
         loss_dict["diag_hard_fake_count"] = hard_fake_mask.float().sum().detach()
         loss_dict["diag_patch_entropy"] = entropy.mean().detach()
+        loss_dict["diag_patch_variance"] = tile_variance.mean().detach()
         loss_dict["diag_mean_q_base"] = gate_probs[:, 0].mean().detach()
         loss_dict["diag_mean_q_artifact"] = gate_probs[:, 1].mean().detach()
         loss_dict["diag_mean_q_structure"] = gate_probs[:, 2].mean().detach()
         loss_dict["diag_mean_q_patch"] = gate_probs[:, 3].mean().detach()
+        loss_dict["diag_family_delta_artifact"] = family_delta[:, 1].mean().detach()
+        loss_dict["diag_family_delta_structure"] = family_delta[:, 2].mean().detach()
+        loss_dict["diag_family_delta_patch"] = family_delta[:, 3].mean().detach()
+        loss_dict["diag_family_margin_artifact"] = art_margin.mean().detach()
+        loss_dict["diag_family_margin_structure"] = structure_margin.mean().detach()
+        loss_dict["diag_family_margin_patch"] = patch_margin.mean().detach()
+        loss_dict["diag_best_spec_correction_orig"] = correction_orig.max(dim=1).values.mean().detach()
+        loss_dict["diag_best_spec_correction_family"] = correction_family.max(dim=1).values.mean().detach()
+
+        if self.args.cie_debug_log:
+            print(
+                "[CIE_IAPL] hard_fake_count={:.0f} tile_entropy_mean={:.4f} tile_variance_mean={:.4f}".format(
+                    loss_dict["diag_hard_fake_count"].item(),
+                    loss_dict["diag_patch_entropy"].item(),
+                    loss_dict["diag_patch_variance"].item(),
+                )
+            )
 
         return loss_dict

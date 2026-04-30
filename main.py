@@ -103,6 +103,18 @@ def get_args_parser():
     parser.add_argument('--cie_artifact_train_mode', type=str, default='random_family', choices=['random_family', 'canonical'])
     parser.add_argument('--cie_structure_train_mode', type=str, default='random_family', choices=['random_family', 'canonical'])
     parser.add_argument('--cie_debug_log', type=str2bool, default=False)
+    parser.add_argument('--cie_use_family_base_refs', type=str2bool, default=True)
+    parser.add_argument('--cie_gate_use_aux_stat', type=str2bool, default=True)
+    parser.add_argument('--cie_lambda_family_margin', type=float, default=0.5)
+    parser.add_argument('--cie_art_margin', type=float, default=0.1)
+    parser.add_argument('--cie_structure_margin', type=float, default=0.1)
+    parser.add_argument('--cie_patch_margin', type=float, default=0.1)
+    parser.add_argument('--cie_patch_train_mode', type=str, default='random_family', choices=['random_family', 'canonical'])
+    parser.add_argument('--cie_patch_dropout_prob', type=float, default=0.25)
+    parser.add_argument('--cie_patch_mask_ratio', type=float, default=0.25)
+    parser.add_argument('--cie_return_debug', type=str2bool, default=False)
+    parser.add_argument('--cie_save_diagnostics', type=str2bool, default=False)
+    parser.add_argument('--cie_diagnostics_output', type=str, default='')
 
     # tta
     parser.add_argument('--tta', type=str2bool, default=False)
@@ -152,6 +164,8 @@ def main(args):
 
     # inter tta step
     if args.tta == True:
+        if args.model_variant == 'cie_iapl':
+            raise ValueError("cie_iapl must not use legacy testtime_main; run normal CIE evaluation or diagnostics instead.")
         assert args.eval == True
         testtime_main(args)
         exit()
@@ -181,15 +195,14 @@ def main(args):
     model = build_model(args)
     model = model.to(device)
     model_without_ddp = model
+    model_ema = None
     if args.distributed:
         find_unused_parameters = args.model_variant == "cie_iapl"
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=find_unused_parameters)
         model_without_ddp = model.module
-        if args.ema:
-            model_ema = ModelEmaV2(model.module, decay=0.9999)  # 注意传入的是 model.module
-            print('-----------use EMA train mode----------')
-        else:
-            model_ema = None
+    if args.ema:
+        model_ema = ModelEmaV2(model_without_ddp, decay=0.9999)
+        print('-----------use EMA train mode----------')
     
     if args.eval:
         checkpoint = torch.load(args.pretrained_model, map_location='cpu')

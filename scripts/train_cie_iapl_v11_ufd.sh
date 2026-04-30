@@ -6,10 +6,10 @@ CLIP_PATH=${CLIP_PATH:-/data2/caiguoqing/clip_weights/ViT-L-14.pt}
 IAPL_CKPT=${IAPL_CKPT:-/data2/caiguoqing/modelscope_cache/yihengli/IAPL_pretrain/checkpoint_best_acc_progan.pth}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-6}
 NPROC_PER_NODE=${NPROC_PER_NODE:-1}
-MASTER_PORT=${MASTER_PORT:-29580}
+MASTER_PORT=${MASTER_PORT:-29584}
 EPOCH=${EPOCH:-5}
 OUTPUT_DIR=${OUTPUT_DIR:-results}
-MODEL_NAME=${MODEL_NAME:-cie_iapl_ufd}
+MODEL_NAME=${MODEL_NAME:-cie_iapl_v11_ufd}
 
 export CUDA_VISIBLE_DEVICES
 
