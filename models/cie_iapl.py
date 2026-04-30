@@ -472,6 +472,11 @@ class CIEIAPLModel(nn.Module):
         return outputs
 
     def forward_debug(self, images):
+        """
+        Eval-only debug forward.
+        Returns a full dict of all hypothesis outputs and gate outputs.
+        Must not break engine.evaluate().
+        """
         return self._forward_impl(images)
 
     def forward(self, images):

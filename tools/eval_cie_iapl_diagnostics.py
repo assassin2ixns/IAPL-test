@@ -104,7 +104,7 @@ def _empty_accumulator():
 def _append_batch(acc, labels, outputs):
     labels_np = labels.detach().cpu().numpy().reshape(-1)
     all_logits = outputs["all_logits"].detach().cpu()
-    uniform_logits = all_logits.mean(dim=1)
+    uniform_logits = outputs.get("uniform_logit", outputs["all_logits"].mean(dim=1)).detach().cpu()
     acc["labels"].extend(labels_np.tolist())
     acc["logits"]["final"].extend(outputs["final_logit"].detach().cpu().reshape(-1).tolist())
     acc["logits"]["base"].extend(outputs["base_logit"].detach().cpu().reshape(-1).tolist())
@@ -258,6 +258,8 @@ def main():
             for images, labels in loader:
                 images = images.to(device)
                 labels = labels.to(device)
+                if not hasattr(model, "forward_debug"):
+                    raise AttributeError("CIE diagnostics require model.forward_debug(images).")
                 outputs = model.forward_debug(images)
                 _append_batch(acc, labels, outputs)
             domain_accs[domain] = acc

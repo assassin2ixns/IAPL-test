@@ -165,7 +165,7 @@ def main(args):
     # inter tta step
     if args.tta == True:
         if args.model_variant == 'cie_iapl':
-            raise ValueError("cie_iapl must not use legacy testtime_main; run normal CIE evaluation or diagnostics instead.")
+            raise ValueError("cie_iapl must use the normal eval path and does not support legacy --tta testtime_main.")
         assert args.eval == True
         testtime_main(args)
         exit()
