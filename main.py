@@ -18,6 +18,15 @@ from test_time import testtime_main
 from timm.utils import ModelEmaV2
 from timm.utils import get_state_dict
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    if v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    raise argparse.ArgumentTypeError('Boolean value expected.')
+
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
         
@@ -45,13 +54,14 @@ def get_args_parser():
     parser.add_argument('--clip_max_norm', type=float, default=0.)
     parser.add_argument('--lr_drop', type=int, default=10)
     parser.add_argument('--gamma', type=float, default=0.9)
-    parser.add_argument('--ema', type=bool, default=False)
+    parser.add_argument('--ema', type=str2bool, default=False)
 
     # adapter
     parser.add_argument('--vit_adapter_list', type=list, default=[3, 7, 11, 15, 19, 23])
     parser.add_argument('--text_adapter_list', type=list, default=[])
 
     # model
+    parser.add_argument('--model_variant', type=str, default='clip_adapter', choices=['clip_adapter', 'cie_iapl'])
     parser.add_argument('--backbone', type=str, default='CLIP:ViT-L/14')
     parser.add_argument('--clip_path', type=str, default='/Path/to/ViT-L-14.pt')
 
@@ -62,21 +72,50 @@ def get_args_parser():
     parser.add_argument('--n_ctx', type=int, default=2)
     parser.add_argument('--ctx_init', type=str, default="a photo of a")
     parser.add_argument('--progress_alpha', type=float, default=0.1)
-    parser.add_argument('--condition', type=bool, default=False)
-    parser.add_argument('--gate', type=bool, default=False)
+    parser.add_argument('--condition', type=str2bool, default=False)
+    parser.add_argument('--gate', type=str2bool, default=False)
+
+    # CIE-IAPL
+    parser.add_argument('--cie_num_specialists', type=int, default=3)
+    parser.add_argument('--cie_use_base_expert', type=str2bool, default=True)
+    parser.add_argument('--cie_init_from_iapl_ckpt', type=str, default="")
+    parser.add_argument('--cie_residual_init_std', type=float, default=1e-4)
+    parser.add_argument('--cie_warmup_epochs', type=int, default=2)
+    parser.add_argument('--cie_gate_warmup_epochs', type=int, default=1)
+    parser.add_argument('--cie_condition_source', type=str, default='original', choices=['original', 'expert_view'])
+    parser.add_argument('--cie_gate_mode', type=str, default='learned', choices=['learned', 'uniform'])
+    parser.add_argument('--cie_gate_hidden_dim', type=int, default=32)
+    parser.add_argument('--cie_oracle_tau', type=float, default=0.5)
+    parser.add_argument('--cie_oracle_margin', type=float, default=0.1)
+    parser.add_argument('--cie_lambda_base', type=float, default=0.5)
+    parser.add_argument('--cie_lambda_spec', type=float, default=0.5)
+    parser.add_argument('--cie_lambda_gate', type=float, default=1.0)
+    parser.add_argument('--cie_lambda_oracle', type=float, default=0.5)
+    parser.add_argument('--cie_lambda_div', type=float, default=0.02)
+    parser.add_argument('--cie_lambda_patch', type=float, default=0.05)
+    parser.add_argument('--cie_lambda_fake', type=float, default=0.2)
+    parser.add_argument('--cie_hard_fake_margin', type=float, default=0.5)
+    parser.add_argument('--cie_hard_fake_threshold', type=float, default=0.0)
+    parser.add_argument('--cie_patch_tile_grid', type=int, default=2)
+    parser.add_argument('--cie_patch_entropy_min', type=float, default=1.0)
+    parser.add_argument('--cie_patch_temp', type=float, default=1.0)
+    parser.add_argument('--cie_eval_mode', type=str, default='final', choices=['final', 'base', 'artifact', 'structure', 'patch', 'uniform'])
+    parser.add_argument('--cie_artifact_train_mode', type=str, default='random_family', choices=['random_family', 'canonical'])
+    parser.add_argument('--cie_structure_train_mode', type=str, default='random_family', choices=['random_family', 'canonical'])
+    parser.add_argument('--cie_debug_log', type=str2bool, default=False)
 
     # tta
-    parser.add_argument('--tta', type=bool, default=False)
+    parser.add_argument('--tta', type=str2bool, default=False)
     parser.add_argument('--tta_steps', type=int, default=1)
     parser.add_argument('--selection_p', type=float, default=0.2)
-    parser.add_argument('--ois', type=bool, default=False)
+    parser.add_argument('--ois', type=str2bool, default=False)
 
     # loss
     parser.add_argument('--loss_adapter', type=float, default=1.0)
     parser.add_argument('--loss_contrast', type=float, default=1.0)
     parser.add_argument('--loss_condition', type=float, default=1.0)
-    parser.add_argument('--use_contrast', type=bool, default=False)
-    parser.add_argument('--smooth', type=bool, default=False)
+    parser.add_argument('--use_contrast', type=str2bool, default=False)
+    parser.add_argument('--smooth', type=str2bool, default=False)
 
     # output
     parser.add_argument('--eval', action='store_true')
@@ -143,7 +182,8 @@ def main(args):
     model = model.to(device)
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=False)
+        find_unused_parameters = args.model_variant == "cie_iapl"
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=find_unused_parameters)
         model_without_ddp = model.module
         if args.ema:
             model_ema = ModelEmaV2(model.module, decay=0.9999)  # 注意传入的是 model.module
@@ -213,6 +253,8 @@ def main(args):
         epoch_start_time = time.time()
         if args.distributed:
             sampler_train.set_epoch(epoch)
+        if hasattr(model_without_ddp, 'set_epoch'):
+            model_without_ddp.set_epoch(epoch)
         train_one_epoch(model, data_loader_train, optimizer, device, epoch, lr_scheduler, args.clip_max_norm, args=args, model_ema = model_ema)
         
         lr_scheduler.step()
